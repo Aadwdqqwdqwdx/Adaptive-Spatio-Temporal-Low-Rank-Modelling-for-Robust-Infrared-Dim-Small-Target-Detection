@@ -1,0 +1,137 @@
+
+clc; clear; close all;
+
+% 设置路径
+sourcefilefolder = '';
+aimfilefolder = '';
+
+% 配准参数设置
+transformType = 'translation';   % 变换类型：可选 'translation','rigid','similarity','affine'
+                                 % 若背景偏移包含旋转或缩放，请改为相应类型
+
+% 调用配准主函数
+preprocess_image_sequence(sourcefilefolder, aimfilefolder, transformType);
+
+%% ------------------------------------------------------------------------
+function preprocess_image_sequence(srcFolder, dstFolder, transType)
+% 预处理图像序列：将 srcFolder 中的所有 .bmp 图像配准到第一帧，自动切除黑边，保存到 dstFolder
+% 输入：
+%   srcFolder  - 源图像文件夹路径
+%   dstFolder  - 目标文件夹路径
+%   transType  - 变换类型字符串
+
+% 获取所有 .bmp 文件（可根据需要修改扩展名）
+%fileList = dir(fullfile(srcFolder, '*.bmp'));
+fileList = dir(fullfile(srcFolder, '*.bmp'));
+if isempty(fileList)
+    error('源文件夹中没有找到 .bmp 文件');
+end
+nFiles = length(fileList);
+fprintf('找到 %d 个图像文件\n', nFiles);
+
+% 创建目标文件夹（如果不存在）
+if ~exist(dstFolder, 'dir')
+    mkdir(dstFolder);
+end
+
+% 读取参考图像（第一帧）
+refPath = fullfile(srcFolder, fileList(1).name);
+refImg = imread(refPath);
+if size(refImg, 3) == 3
+    refImg = rgb2gray(refImg);
+end
+refImg = double(refImg);  % imregtform 要求 double 类型
+
+% 保存参考图像到内存（用于配准）
+% 将所有配准后的图像先存入 cell 数组，以便后续计算公共区域
+alignedImages = cell(1, nFiles);
+alignedImages{1} = uint8(refImg);  % 第一帧不变
+
+% 设置配准优化器与度量（单模态）
+[optimizer, metric] = imregconfig('monomodal');
+optimizer.MaximumIterations = 500;      % 增加迭代次数提高精度
+optimizer.MaximumStepLength = 0.01;     % 适当调整步长
+
+% 用于存储每一帧有效区域的边界框 [xmin, ymin, xmax, ymax]（像素索引）
+bboxes = zeros(nFiles, 4);
+
+% 第一帧的有效区域是整个图像（因为它是参考帧，没有变换产生的黑边）
+[imgH, imgW] = size(refImg);
+bboxes(1, :) = [1, 1, imgW, imgH];
+
+% 先配准所有帧，保存对齐后的图像到 cell，并记录每帧的有效区域边界框
+for k = 2:nFiles
+    fprintf('配准第 %d/%d 帧：%s\n', k, nFiles, fileList(k).name);
+    
+    % 读取待配准图像
+    movPath = fullfile(srcFolder, fileList(k).name);
+    movImg = imread(movPath);
+    if size(movImg, 3) == 3
+        movImg = rgb2gray(movImg);
+    end
+    movImg = double(movImg);
+    
+    try
+        % 计算变换矩阵
+        tform = imregtform(movImg, refImg, transType, optimizer, metric);
+        
+        % 应用变换，输出与参考图像相同尺寸（这样所有帧大小一致）
+        alignedImg = imwarp(movImg, tform, 'OutputView', imref2d(size(refImg)));
+        
+        % 裁剪到 [0,255] 并转换为 uint8
+        alignedImg = max(0, min(255, round(alignedImg)));
+        alignedImg = uint8(alignedImg);
+        
+        % 计算有效区域边界框（非零像素的区域，假设黑边填充为0）
+        mask = alignedImg > 0;
+        if any(mask(:))
+            [rows, cols] = find(mask);
+            xmin = min(cols);
+            xmax = max(cols);
+            ymin = min(rows);
+            ymax = max(rows);
+            bboxes(k, :) = [xmin, ymin, xmax, ymax];
+        else
+            % 如果没有有效像素（全黑），则发出警告并临时设为全图（但后续可能出错）
+            warning('帧 %s 变换后全黑，请检查配准结果', fileList(k).name);
+            bboxes(k, :) = [1, 1, imgW, imgH];
+        end
+    catch ME
+        warning('配准失败（帧 %s），将保存原图。错误信息：%s', fileList(k).name, ME.message);
+        alignedImg = uint8(movImg);
+        % 如果保存原图，有效区域是全图
+        bboxes(k, :) = [1, 1, imgW, imgH];
+    end
+    
+    alignedImages{k} = alignedImg;
+end
+
+% 计算所有帧有效区域的交集（公共区域）
+common_xmin = max(bboxes(:, 1));
+common_ymin = max(bboxes(:, 2));
+common_xmax = min(bboxes(:, 3));
+common_ymax = min(bboxes(:, 4));
+
+% 检查公共区域是否有效
+if common_xmin >= common_xmax || common_ymin >= common_ymax
+    error('所有帧的有效区域没有重叠部分，无法切除黑边。请检查配准效果或考虑其他处理方法。');
+end
+
+fprintf('公共有效区域：x=[%d, %d], y=[%d, %d]，宽度=%d，高度=%d\n', ...
+    common_xmin, common_xmax, common_ymin, common_ymax, ...
+    common_xmax - common_xmin + 1, common_ymax - common_ymin + 1);
+
+% 对每一帧进行裁剪并保存
+for k = 1:nFiles
+    img = alignedImages{k};
+    % 裁剪公共区域
+    croppedImg = img(common_ymin:common_ymax, common_xmin:common_xmax);
+    % 保存
+    imwrite(croppedImg, fullfile(dstFolder, fileList(k).name));
+end
+
+fprintf('预处理完成！结果保存在：%s\n', dstFolder);
+fprintf('所有图像已裁剪到公共有效区域，尺寸：%d x %d\n', ...
+    common_xmax - common_xmin + 1, common_ymax - common_ymin + 1);
+
+end
