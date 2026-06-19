@@ -1,0 +1,930 @@
+
+clc; clear all; close all;
+addpath('common');
+
+%% 参数设置
+sourcefilefolder = '';
+aimfilefolder = '';
+
+% 确保目标文件夹存在
+if ~exist(aimfilefolder, 'dir')
+    mkdir(aimfilefolder);
+end
+
+%% 读取图像序列
+%dirOutput = dir(fullfile(sourcefilefolder, '*.bmp'));
+dirOutput = dir(fullfile(sourcefilefolder, '*.bmp'));
+fileNames = {dirOutput.name};
+num_images = numel(fileNames);
+
+if num_images == 0
+    error('没有找到.bmp文件！请检查源文件夹路径。');
+end
+
+fprintf('找到 %d 张图像\n', num_images);
+
+% 读取所有图像
+image_sequence = cell(1, num_images);
+for i = 1:num_images
+    img_path = fullfile(sourcefilefolder, fileNames{i});
+    img = imread(img_path);
+    if size(img, 3) == 3  % 如果是RGB图像
+        img = rgb2gray(img); % 转为灰度
+    end
+    image_sequence{i} = img;
+end
+
+%% 构建视频矩阵（同时获取真实图像尺寸）
+[D, img_height, img_width] = build_video_matrix(image_sequence);
+[m, n] = size(D);
+fprintf('视频矩阵大小: %d x %d (像素 x 帧数)\n', m, n);
+fprintf('图像尺寸: %d x %d\n', img_height, img_width);
+
+%% 设置参数（改进版2——加入动态先验权重）
+params = struct();
+
+% 基础参数
+params.patch_size = 16;        % 块大小，用于局部权重计算
+%params.lambda = 0.5;           % 稀疏项权重
+params.lambda = 0.5;
+%params.mu = 10;                 % 低秩项权重
+params.mu = 10;
+params.max_iter = 9900;         % 最大迭代次数
+params.tol = 1e-7;              % 收敛容差
+params.display = true;          % 显示中间结果
+
+% 结构张量先验参数（改进：加入动态先验）
+params.structure_weight = 0.3;  % 结构张量先验总权重
+params.sigma_gradient = 1.5;    % 梯度计算的高斯标准差
+params.use_structure_prior = true; % 是否使用结构张量先验
+params.dynamic_prior_weight = 0.2; % 动态先验（帧差）在总先验中的比例，0表示只用静态，1表示只用动态
+
+% 新增参数
+params.corner_strength_type = 'shi-tomasi'; % 角点强度类型
+params.postprocess = true;       % 是否启用后处理
+params.min_target_area = 4;      % 最小目标面积（像素）
+params.max_target_area = 100;    % 最大目标面积（像素）
+
+% 将图像尺寸存入params，供子函数使用
+params.img_height = img_height;
+params.img_width = img_width;
+
+%% 执行带结构张量先验的双重自适应低秩稀疏分解（改进版2）
+if params.use_structure_prior
+    fprintf('=== 开始带动态结构张量先验的弱小目标检测（改进版2） ===\n');
+    [L, S, background_rank, W, structure_prior] = ...
+        dual_adaptive_lr_target_detection_with_structure_improved2(D, params);
+else
+    fprintf('=== 开始标准低秩稀疏分解 ===\n');
+    [L, S, background_rank, W] = dual_adaptive_lr_target_detection(D, params);
+end
+
+%% 保存结果
+fprintf('保存结果到: %s\n', aimfilefolder);
+
+for i = 1:num_images
+    % 恢复图像尺寸
+    height = img_height;
+    width = img_width;
+    
+    % 提取背景和目标
+    bg_img = reshape(L(:, i), [height, width]);
+    target_img = reshape(S(:, i), [height, width]);
+    
+    % 保存背景图像（8位无符号整数）
+    bg_filename = fullfile(aimfilefolder, ['background_', fileNames{i}]);
+    bg_img_uint8 = uint8(mat2gray(bg_img) * 255);
+    imwrite(bg_img_uint8, bg_filename);
+    
+    % 保存原始目标图像
+    target_filename = fullfile(aimfilefolder, ['target_', fileNames{i}]);
+    target_normalized = mat2gray(abs(target_img));
+    target_uint8 = uint8(target_normalized * 255);
+    imwrite(target_uint8, target_filename);
+    
+    % 保存增强的目标图像（应用改进的后处理）
+    if params.postprocess
+        target_enhanced = apply_target_enhancement_improved(target_img, ...
+            params.min_target_area, params.max_target_area);
+    else
+        target_enhanced = apply_target_enhancement(target_img);
+    end
+    enhanced_filename = fullfile(aimfilefolder, ['enhanced_target_', fileNames{i}]);
+    imwrite(target_enhanced, enhanced_filename);
+    
+    % 保存原始图像作为对比
+    orig_filename = fullfile(aimfilefolder, ['original_', fileNames{i}]);
+    imwrite(image_sequence{i}, orig_filename);
+end
+
+%% 生成结果报告（传入图像尺寸）
+generate_result_report_improved(D, L, S, W, structure_prior, background_rank, aimfilefolder, params, img_height, img_width);
+
+fprintf('\n=== 处理完成 ===\n');
+fprintf('结果保存在: %s\n', aimfilefolder);
+fprintf('估计的背景秩: %d\n', background_rank);
+fprintf('处理图像数量: %d\n', num_images);
+
+%% ================== 辅助函数定义 ==================
+
+function [D, height, width] = build_video_matrix(image_sequence)
+% 构建视频矩阵，同时返回图像高度和宽度
+if iscell(image_sequence)
+    num_frames = length(image_sequence);
+    [height, width] = size(image_sequence{1});
+    
+    D = zeros(height * width, num_frames);
+    
+    for i = 1:num_frames
+        frame = double(image_sequence{i});
+        D(:, i) = frame(:);
+    end
+elseif ndims(image_sequence) == 4
+    [height, width, channels, num_frames] = size(image_sequence);
+    if channels > 1
+        gray_sequence = zeros(height, width, num_frames);
+        for i = 1:num_frames
+            gray_sequence(:, :, i) = rgb2gray(image_sequence(:, :, :, i));
+        end
+        image_sequence = gray_sequence;
+    end
+    D = reshape(image_sequence, [height * width, num_frames]);
+    D = double(D);
+elseif ndims(image_sequence) == 3
+    [height, width, num_frames] = size(image_sequence);
+    D = reshape(image_sequence, [height * width, num_frames]);
+    D = double(D);
+end
+end
+
+function [L, S, background_rank, W, structure_prior] = ...
+    dual_adaptive_lr_target_detection_with_structure_improved2(D, params)
+% 带结构张量先验的双重自适应低秩稀疏分解（改进版2：融合动态帧差信息）
+% 专门针对雪花噪声优化，加入动态先验
+
+%% 参数设置
+if nargin < 2
+    params = struct();
+end
+
+% 默认参数
+default_params = {
+    'patch_size', 16;
+    'lambda', 0.5;
+    'mu', 10;
+    'max_iter', 200;
+    'tol', 1e-6;
+    'display', true;
+    'structure_weight', 0.3;
+    'sigma_gradient', 1.5;
+    'use_structure_prior', true;
+    'corner_strength_type', 'shi-tomasi';
+    'postprocess', true;
+    'min_target_area', 5;
+    'max_target_area', 200;
+    'img_height', [];   % 必须传入
+    'img_width', [];    % 必须传入
+    'dynamic_prior_weight', 0.5; % 新增：动态先验比例
+};
+
+for i = 1:size(default_params, 1)
+    if ~isfield(params, default_params{i,1})
+        params.(default_params{i,1}) = default_params{i,2};
+    end
+end
+
+% 提取图像尺寸
+img_height = params.img_height;
+img_width = params.img_width;
+if isempty(img_height) || isempty(img_width)
+    error('必须提供图像尺寸参数 img_height 和 img_width');
+end
+
+[m, n] = size(D);
+
+%% 第一部分：基于局部背景复杂度的空间权重计算
+fprintf('计算局部背景复杂度权重...\n');
+W = compute_spatial_weights_improved(D, params.patch_size, img_height, img_width);
+
+%% 第二部分：计算结构张量先验（改进版2：融合动态帧差信息）
+fprintf('计算动态结构张量先验（融合帧间差分）...\n');
+structure_prior = compute_structure_tensor_prior_improved2(D, params, img_height, img_width);
+
+%% 第三部分：基于全局奇异值拐点的秩估计
+fprintf('分析全局奇异值拐点...\n');
+k_global = estimate_global_rank_improved(D);
+fprintf('估计的全局秩: %d\n', k_global);
+
+%% 第四部分：带结构张量先验的自适应低秩稀疏分解（改进版2）
+fprintf('开始带动态结构张量先验的自适应低秩稀疏分解...\n');
+[L, S, background_rank] = adaptive_lr_decomposition_with_structure_improved(...
+    D, W, structure_prior, k_global, params, img_height, img_width);
+
+%% 结果显示
+if params.display
+    display_results_with_structure_improved(D, L, S, W, structure_prior, background_rank, img_height, img_width);
+end
+end
+
+function W = compute_spatial_weights_improved(D, patch_size, img_height, img_width)
+% 计算基于局部复杂度的空间权重矩阵（改进版）
+[m, n] = size(D);
+if m ~= img_height * img_width
+    error('矩阵行数与图像尺寸不匹配：%d vs %d*%d=%d', m, img_height, img_width, img_height*img_width);
+end
+
+% 初始化权重矩阵
+W = zeros(img_height, img_width);
+
+% 计算平均图像以减少噪声影响
+avg_frame = mean(reshape(D, [img_height, img_width, n]), 3);
+
+% 计算局部方差（使用平均图像）
+local_var = nlfilter(avg_frame, [patch_size, patch_size], @(x) var(x(:)));
+
+% 计算梯度幅值（使用平均图像）
+[gx, gy] = gradient(double(avg_frame));
+grad_mag = sqrt(gx.^2 + gy.^2);
+
+% 平滑梯度幅值以降低噪声影响
+grad_mag = imgaussfilt(grad_mag, 1.0);
+
+% 综合复杂度度量（调整权重）
+complexity = 0.6 * mat2gray(local_var) + 0.4 * mat2gray(grad_mag);
+
+% 归一化到[0.2, 0.8]范围（避免极端值）
+W_min = min(complexity(:));
+W_max = max(complexity(:));
+if W_max > W_min
+    W = 0.2 + 0.6 * (complexity - W_min) / (W_max - W_min);
+else
+    W = 0.5 * ones(size(complexity));
+end
+
+% 平滑权重矩阵（更强平滑）
+W = imgaussfilt(W, 3.0);
+
+% 向量化权重矩阵
+W = W(:);
+end
+
+function structure_prior = compute_structure_tensor_prior_improved2(D, params, img_height, img_width)
+% 从图像序列计算结构张量先验（改进版2：融合动态帧差信息）
+% 输入：D - 视频矩阵 (像素数×帧数)
+%       params - 参数结构体（包含 sigma_gradient, corner_strength_type, dynamic_prior_weight）
+%       img_height, img_width - 图像尺寸
+% 输出：structure_prior - 结构先验向量 (像素数×1)
+
+[m, n] = size(D);
+if m ~= img_height * img_width
+    error('矩阵行数与图像尺寸不匹配');
+end
+
+% 1. 计算静态先验：基于平均图像
+avg_image = mean(D, 2);
+avg_image_2d = reshape(avg_image, [img_height, img_width]);
+
+% 对平均图像进行预处理
+avg_image_2d = medfilt2(avg_image_2d, [3, 3]);
+avg_image_2d = imgaussfilt(avg_image_2d, 0.5);
+
+static_prior_2d = compute_structure_tensor_improved(avg_image_2d, params.sigma_gradient, params.corner_strength_type);
+
+% 2. 计算动态先验：基于帧间差分图像的均值
+if n >= 2
+    % 计算帧间差分（列差分，得到 n-1 个差分向量）
+    diff_frames = diff(D, 1, 2);          % 大小 m × (n-1)
+    % 取绝对值并平均，得到平均差分图像
+    avg_diff = mean(abs(diff_frames), 2);
+    diff_image_2d = reshape(avg_diff, [img_height, img_width]);
+    
+    % 对差分图像进行预处理（与静态类似）
+    diff_image_2d = medfilt2(diff_image_2d, [3, 3]);
+    diff_image_2d = imgaussfilt(diff_image_2d, 0.5);
+    
+    dynamic_prior_2d = compute_structure_tensor_improved(diff_image_2d, params.sigma_gradient, params.corner_strength_type);
+else
+    % 如果只有一帧，动态先验置为零（或与静态相同）
+    dynamic_prior_2d = zeros(img_height, img_width);
+    params.dynamic_prior_weight = 0;   % 强制只用静态
+end
+
+% 3. 融合静态与动态先验
+alpha = params.dynamic_prior_weight;   % 动态先验比例
+beta = 1 - alpha;                       % 静态先验比例
+fused_prior_2d = beta * static_prior_2d + alpha * dynamic_prior_2d;
+
+% 4. 对融合后的先验进行后处理
+% 形态学开运算去除小点
+se = strel('disk', 1);
+fused_prior_2d = imopen(fused_prior_2d, se);
+% 高斯平滑
+fused_prior_2d = imgaussfilt(fused_prior_2d, 1.0);
+% 归一化到[0.1, 0.9]范围
+sp_min = min(fused_prior_2d(:));
+sp_max = max(fused_prior_2d(:));
+if sp_max > sp_min
+    fused_prior_2d = 0.1 + 0.8 * (fused_prior_2d - sp_min) / (sp_max - sp_min);
+else
+    fused_prior_2d = 0.5 * ones(size(fused_prior_2d));
+end
+
+structure_prior = fused_prior_2d(:);
+end
+
+function structure_tensor = compute_structure_tensor_improved(image, sigma, corner_type)
+% 计算图像的结构张量（改进版）
+% 输入: image - 2D图像矩阵
+%       sigma - 高斯滤波的标准差
+%       corner_type - 角点强度类型
+
+if nargin < 3
+    corner_type = 'shi-tomasi';
+end
+
+% 对图像进行预处理：高斯平滑减少噪声
+if sigma > 0
+    image = imgaussfilt(image, sigma);
+end
+
+% 计算梯度
+[Gx, Gy] = gradient(double(image));
+
+% 高斯平滑梯度
+if sigma > 0
+    Gx = imgaussfilt(Gx, sigma);
+    Gy = imgaussfilt(Gy, sigma);
+end
+
+% 计算结构张量的分量
+J11 = Gx .^ 2;
+J12 = Gx .* Gy;
+J22 = Gy .^ 2;
+
+% 进一步平滑结构张量分量
+if sigma > 0
+    J11 = imgaussfilt(J11, sigma);
+    J12 = imgaussfilt(J12, sigma);
+    J22 = imgaussfilt(J22, sigma);
+end
+
+% 计算结构张量的特征值
+trace_J = J11 + J22;
+det_J = J11 .* J22 - J12 .^ 2;
+discriminant = sqrt((J11 - J22).^2 + 4 * J12.^2);
+
+% 计算特征值
+lambda1 = 0.5 * (trace_J + discriminant);
+lambda2 = 0.5 * (trace_J - discriminant);
+
+% 根据选择的类型计算角点强度
+switch lower(corner_type)
+    case 'max-eigenvalue'
+        structure_strength = lambda1;
+    case 'min-eigenvalue'
+        structure_strength = lambda2;
+    case 'shi-tomasi'
+        % 改进的 Shi-Tomasi 响应
+        structure_strength = 8.*(lambda1.*lambda2).^2./((lambda1+lambda2).^3+0.005);
+    case 'harris'
+        k = 0.04;
+        structure_strength = lambda1 .* lambda2 - k * (lambda1 + lambda2).^2;
+    case 'harmonic-mean'
+        structure_strength = 2 * lambda1 .* lambda2 ./ (lambda1 + lambda2 + eps);
+    otherwise
+        structure_strength = min(lambda1, lambda2);
+end
+
+% 对结果进行后处理
+structure_strength = max(structure_strength, 0);
+structure_strength = imgaussfilt(structure_strength, 1.0);
+
+structure_tensor = structure_strength + eps;
+end
+
+function k_global = estimate_global_rank_improved(D)
+% 通过奇异值分析估计全局秩（改进版）
+[~, S, ~] = svd(D, 'econ');
+s = diag(S);
+
+% 方法1: 能量阈值法（保留98%的能量）
+cumulative_energy = cumsum(s.^2) / sum(s.^2);
+energy_threshold_idx = find(cumulative_energy >= 0.98, 1);
+
+% 方法2: 基于对数尺度的变化率
+s_log = log10(s + eps);
+diff_log = abs(diff(s_log));
+[~, max_diff_idx] = max(diff_log);
+
+% 方法3: 拐点检测（二阶差分）
+s_norm = s / s(1);
+second_diff = diff(s_norm, 2);
+[~, inflection_idx] = max(abs(second_diff));
+
+% 综合三种方法，取最小值作为保守估计
+k_global = min([energy_threshold_idx, max_diff_idx + 2, inflection_idx + 3]);
+
+% 限制最大秩不超过数据维度的1/4
+max_allowed_rank = floor(min(size(D)) / 4);
+k_global = min(k_global, max_allowed_rank);
+
+% 确保至少秩为2
+k_global = max(k_global, 2);
+
+fprintf('秩估计结果: 能量法=%d, 对数变化法=%d, 拐点法=%d, 最终秩=%d\n', ...
+    energy_threshold_idx, max_diff_idx + 2, inflection_idx + 3, k_global);
+end
+
+function [L, S, background_rank] = adaptive_lr_decomposition_with_structure_improved(...
+    D, W, structure_prior, k_global, params, img_height, img_width)
+% 执行带结构张量先验的自适应低秩稀疏分解（改进版）
+[m, n] = size(D);
+L = zeros(m, n);  % 低秩背景
+S = zeros(m, n);  % 稀疏目标
+Y = zeros(m, n);  % 拉格朗日乘子
+
+% ADMM参数
+rho = 1.0;        % 惩罚参数
+mu = params.mu;   % 加权项系数
+lambda = params.lambda; % 稀疏项基础权重
+gamma = params.structure_weight; % 结构张量先验权重
+
+% 将权重矩阵扩展为与D相同尺寸
+W_expanded = repmat(W, 1, n);
+
+% 扩展结构先验矩阵
+structure_expanded = repmat(structure_prior, 1, n);
+
+% 初始化记录
+primal_residuals = zeros(params.max_iter, 1);
+dual_residuals = zeros(params.max_iter, 1);
+ranks = zeros(params.max_iter, 1);
+
+fprintf('迭代优化中...\n');
+for iter = 1:params.max_iter
+    % 保存前一次迭代的结果
+    L_prev = L;
+    S_prev = S;
+    
+    % 更新L: 低秩背景分量
+    [L, current_rank] = update_low_rank_component_improved(D - S + Y/rho, W_expanded, k_global, mu, rho);
+    ranks(iter) = current_rank;
+    
+    % 更新S: 稀疏目标分量（带结构张量先验，改进版）
+    if params.use_structure_prior
+        S = update_sparse_component_with_structure_improved(...
+            D - L + Y/rho, lambda/rho, gamma, structure_expanded);
+    else
+        S = update_sparse_component(D - L + Y/rho, lambda/rho);
+    end
+    
+    % 更新拉格朗日乘子
+    Y = Y + rho * (D - L - S);
+    
+    % 检查收敛性
+    primal_residual = norm(D - L - S, 'fro') / norm(D, 'fro');
+    dual_residual = rho * norm(L - L_prev + S - S_prev, 'fro') / norm(D, 'fro');
+    
+    primal_residuals(iter) = primal_residual;
+    dual_residuals(iter) = dual_residual;
+    
+    if params.display && mod(iter, 20) == 0
+        fprintf('迭代 %3d: 主残差=%.6f, 对偶残差=%.6f, 当前秩=%d\n', ...
+                iter, primal_residual, dual_residual, current_rank);
+    end
+    
+    % 自适应调整rho
+    if iter > 10 && mod(iter, 10) == 0
+        if primal_residual > 10 * dual_residual
+            rho = min(rho * 1.5, 10);
+        elseif dual_residual > 10 * primal_residual
+            rho = max(rho / 1.5, 0.1);
+        end
+    end
+    
+    % 收敛判断
+    if primal_residual < params.tol && dual_residual < params.tol
+        fprintf('在迭代 %d 收敛\n', iter);
+        primal_residuals = primal_residuals(1:iter);
+        dual_residuals = dual_residuals(1:iter);
+        ranks = ranks(1:iter);
+        break;
+    end
+end
+
+% 如果未收敛，使用最后一次迭代结果
+if iter == params.max_iter
+    fprintf('达到最大迭代次数 %d\n', params.max_iter);
+end
+
+background_rank = current_rank;
+
+% 对S进行后处理去除噪声（传入图像尺寸）
+if params.postprocess
+    S = postprocess_sparse_component(S, params.min_target_area, params.max_target_area, img_height, img_width);
+end
+
+% 绘制收敛曲线
+if params.display
+    plot_convergence_curves(primal_residuals, dual_residuals, ranks);
+end
+end
+
+function [L, current_rank] = update_low_rank_component_improved(M, W, k_global, mu, rho)
+% 更新低秩背景分量，考虑空间权重（改进版）
+[U, Sigma, V] = svd(M, 'econ');
+sigma = diag(Sigma);
+
+% 计算自适应阈值
+avg_weight = mean(W(:));
+if avg_weight > 0
+    adaptive_factor = 0.5 + 0.5 * avg_weight;
+    tau = adaptive_factor / (rho + mu * avg_weight);
+else
+    tau = 1.0 / rho;
+end
+
+% 应用软阈值
+sigma_soft = max(sigma - tau, 0);
+
+% 确定实际使用的秩
+current_rank = sum(sigma_soft > 1e-8);
+current_rank = min(current_rank, k_global);
+
+% 重构低秩矩阵
+if current_rank > 0
+    L = U(:, 1:current_rank) * diag(sigma_soft(1:current_rank)) * V(:, 1:current_rank)';
+else
+    L = zeros(size(M));
+end
+end
+
+function S = update_sparse_component_with_structure_improved(M, tau, gamma, structure_prior)
+% 使用带结构张量先验的软阈值更新稀疏分量（改进版）
+alpha = 1.5;
+threshold_factor = 1 + gamma * (structure_prior .^ alpha);
+adaptive_tau = tau .* threshold_factor;
+
+S = sign(M) .* max(abs(M) - adaptive_tau, 0);
+end
+
+function S_processed = postprocess_sparse_component(S, min_area, max_area, img_height, img_width)
+% 对稀疏分量进行后处理，去除雪花噪声
+[m, n] = size(S);
+
+if m == img_height * img_width
+    S_processed = zeros(size(S));
+    for i = 1:n
+        s_img = reshape(S(:, i), [img_height, img_width]);
+        
+        % 1. 取绝对值
+        s_abs = abs(s_img);
+        
+        % 2. 二值化（自适应阈值）
+        if max(s_abs(:)) > 0
+            T = graythresh(s_abs / max(s_abs(:)));
+            s_binary = s_abs > T * max(s_abs(:));
+        else
+            s_binary = zeros(size(s_abs));
+        end
+        
+        % 3. 形态学操作
+        se_open = strel('disk', 1);
+        s_binary = imopen(s_binary, se_open);
+        se_close = strel('disk', 2);
+        s_binary = imclose(s_binary, se_close);
+        
+        % 4. 连通区域分析
+        cc = bwconncomp(s_binary, 8);
+        stats = regionprops(cc, 'Area', 'Eccentricity', 'Solidity', 'BoundingBox');
+        
+        valid_regions = false(1, cc.NumObjects);
+        for j = 1:cc.NumObjects
+            area = stats(j).Area;
+            eccentricity = stats(j).Eccentricity;
+            solidity = stats(j).Solidity;
+            
+            area_ok = (area >= min_area) && (area <= max_area);
+            shape_ok = (eccentricity < 0.9) && (solidity > 0.3);
+            
+            valid_regions(j) = area_ok && shape_ok;
+        end
+        
+        % 创建掩码
+        mask = zeros(size(s_binary));
+        for j = 1:cc.NumObjects
+            if valid_regions(j)
+                mask(cc.PixelIdxList{j}) = 1;
+            end
+        end
+        
+        % 5. 应用掩码到原始稀疏分量
+        s_processed = s_img .* mask;
+        S_processed(:, i) = s_processed(:);
+    end
+else
+    S_processed = S;
+end
+end
+
+function enhanced_target = apply_target_enhancement_improved(target_img, min_area, max_area)
+% 对目标图像进行增强处理（改进版）
+target_abs = abs(target_img);
+
+% 自适应阈值去噪
+if max(target_abs(:)) > 0
+    T = graythresh(target_abs / max(target_abs(:)));
+    target_thresh = target_abs > T * max(target_abs(:));
+else
+    target_thresh = zeros(size(target_abs));
+end
+
+% 形态学操作
+se_open = strel('disk', 1);
+target_open = imopen(target_thresh, se_open);
+se_close = strel('disk', 2);
+target_close = imclose(target_open, se_close);
+
+% 连通区域分析（如果提供了面积参数）
+if nargin >= 3
+    cc = bwconncomp(target_close, 8);
+    stats = regionprops(cc, 'Area');
+    area = [stats.Area];
+    
+    valid_regions = (area >= min_area) & (area <= max_area);
+    
+    target_filtered = zeros(size(target_close));
+    for i = 1:cc.NumObjects
+        if valid_regions(i)
+            target_filtered(cc.PixelIdxList{i}) = 1;
+        end
+    end
+else
+    target_filtered = target_close;
+end
+
+% 恢复强度信息
+enhanced_target = target_filtered .* target_abs;
+
+% 归一化显示
+if max(enhanced_target(:)) > 0
+    enhanced_target = enhanced_target / max(enhanced_target(:));
+end
+
+% 应用颜色映射增强显示
+enhanced_target = ind2rgb(round(enhanced_target * 255), hot(256));
+end
+
+function display_results_with_structure_improved(D, L, S, W, structure_prior, background_rank, img_height, img_width)
+% 显示分解结果（改进版）
+[m, n] = size(D);
+
+% 显示第一帧和中间帧的结果
+frame_indices = [1, floor(n/2), min(n, 3)];
+
+figure('Position', [50, 50, 1800, 1200], 'Name', '弱小目标检测结果（改进版）');
+
+for idx = 1:length(frame_indices)
+    frame_idx = frame_indices(idx);
+    
+    % 原始图像
+    subplot(6, length(frame_indices), idx);
+    orig_img = reshape(D(:, frame_idx), [img_height, img_width]);
+    imagesc(orig_img); colormap(gray); colorbar;
+    title(sprintf('原始图像 (帧 %d)', frame_idx));
+    axis image;
+    
+    % 低秩背景
+    subplot(6, length(frame_indices), idx + length(frame_indices));
+    bg_img = reshape(L(:, frame_idx), [img_height, img_width]);
+    imagesc(bg_img); colormap(gray); colorbar;
+    title(sprintf('低秩背景 (秩=%d)', background_rank));
+    axis image;
+    
+    % 稀疏目标（原始）
+    subplot(6, length(frame_indices), idx + 2*length(frame_indices));
+    target_img = reshape(S(:, frame_idx), [img_height, img_width]);
+    imagesc(abs(target_img)); colormap(gray); colorbar;
+    title('稀疏目标（原始）');
+    axis image;
+    
+    % 目标增强显示
+    subplot(6, length(frame_indices), idx + 3*length(frame_indices));
+    target_enhanced = apply_target_enhancement_improved(target_img);
+    imagesc(target_enhanced); colorbar;
+    title('增强的目标');
+    axis image;
+    
+    % 权重分布
+    subplot(6, length(frame_indices), idx + 4*length(frame_indices));
+    weight_img = reshape(W, [img_height, img_width]);
+    imagesc(weight_img); colormap(jet); colorbar;
+    title('空间权重分布');
+    axis image;
+    
+    % 结构张量先验
+    subplot(6, length(frame_indices), idx + 5*length(frame_indices));
+    structure_img = reshape(structure_prior, [img_height, img_width]);
+    imagesc(structure_img); colormap(jet); colorbar;
+    title('结构张量先验（融合动态）');
+    axis image;
+end
+
+% 显示目标统计信息
+figure('Position', [100, 100, 800, 600], 'Name', '目标检测统计');
+
+% 计算每帧的目标数量
+target_counts = zeros(1, n);
+for i = 1:n
+    target_img = reshape(S(:, i), [img_height, img_width]);
+    target_binary = abs(target_img) > 0.1 * max(abs(target_img(:)));
+    target_binary = bwareaopen(target_binary, 5);
+    cc = bwconncomp(target_binary);
+    target_counts(i) = cc.NumObjects;
+end
+
+subplot(2, 2, 1);
+plot(1:n, target_counts, 'b-o', 'LineWidth', 2);
+xlabel('帧号');
+ylabel('目标数量');
+title('每帧检测到的目标数量');
+grid on;
+
+% 目标大小分布
+all_areas = [];
+for i = 1:min(n, 10)
+    target_img = reshape(S(:, i), [img_height, img_width]);
+    target_binary = abs(target_img) > 0.1 * max(abs(target_img(:)));
+    cc = bwconncomp(target_binary);
+    stats = regionprops(cc, 'Area');
+    areas = [stats.Area];
+    all_areas = [all_areas, areas];
+end
+
+subplot(2, 2, 2);
+if ~isempty(all_areas)
+    histogram(all_areas, 20, 'FaceColor', 'g', 'EdgeColor', 'k');
+    xlabel('目标面积（像素）');
+    ylabel('频次');
+    title('目标面积分布');
+    grid on;
+else
+    text(0.5, 0.5, '未检测到目标', 'HorizontalAlignment', 'center');
+end
+
+% 背景与目标能量比
+bg_energy = sum(L(:).^2);
+target_energy = sum(S(:).^2);
+total_energy = bg_energy + target_energy;
+
+subplot(2, 2, 3);
+labels = {'背景', '目标'};
+values = [bg_energy, target_energy] / total_energy;
+pie(values, labels);
+title(sprintf('能量分布 (背景: %.1f%%, 目标: %.1f%%)', ...
+    values(1)*100, values(2)*100));
+
+% 稀疏度
+sparsity = nnz(S) / numel(S);
+
+subplot(2, 2, 4);
+bar(1, sparsity, 'FaceColor', 'm');
+ylim([0, 1]);
+xlabel('稀疏度');
+ylabel('非零元素比例');
+title(sprintf('稀疏度: %.4f', sparsity));
+grid on;
+end
+
+function generate_result_report_improved(D, L, S, W, structure_prior, background_rank, aimfilefolder, params, img_height, img_width)
+% 生成结果报告（改进版）
+[m, n] = size(D);
+
+% 计算各项指标
+reconstruction_error = norm(D - L - S, 'fro') / norm(D, 'fro');
+background_energy = norm(L, 'fro')^2 / norm(D, 'fro')^2;
+target_energy = norm(S, 'fro')^2 / norm(D, 'fro')^2;
+sparsity = nnz(S) / numel(S);
+
+% 计算目标检测统计
+if m == img_height * img_width
+    target_counts = zeros(1, n);
+    target_areas = [];
+    
+    for i = 1:n
+        target_img = reshape(S(:, i), [img_height, img_width]);
+        target_binary = abs(target_img) > 0.1 * max(abs(target_img(:)));
+        target_binary = bwareaopen(target_binary, params.min_target_area);
+        cc = bwconncomp(target_binary);
+        target_counts(i) = cc.NumObjects;
+        
+        stats = regionprops(cc, 'Area');
+        areas = [stats.Area];
+        target_areas = [target_areas, areas];
+    end
+    
+    avg_targets_per_frame = mean(target_counts);
+    max_targets_per_frame = max(target_counts);
+    min_targets_per_frame = min(target_counts);
+    
+    if ~isempty(target_areas)
+        avg_target_area = mean(target_areas);
+        median_target_area = median(target_areas);
+    else
+        avg_target_area = 0;
+        median_target_area = 0;
+    end
+else
+    avg_targets_per_frame = NaN;
+    max_targets_per_frame = NaN;
+    min_targets_per_frame = NaN;
+    avg_target_area = NaN;
+    median_target_area = NaN;
+end
+
+% 保存指标到文件
+report_filename = fullfile(aimfilefolder, 'result_report_improved.txt');
+fid = fopen(report_filename, 'w');
+
+fprintf(fid, '=== 弱小目标检测结果报告（改进版2 - 融合动态先验） ===\n\n');
+fprintf(fid, '处理时间: %s\n', datestr(now));
+fprintf(fid, '图像数量: %d\n', n);
+fprintf(fid, '每帧像素数: %d\n', m);
+fprintf(fid, '图像尺寸: %d x %d\n', img_height, img_width);
+fprintf(fid, '估计的背景秩: %d\n', background_rank);
+fprintf(fid, '\n=== 算法参数 ===\n');
+fprintf(fid, '稀疏项权重 (lambda): %.3f\n', params.lambda);
+fprintf(fid, '低秩项权重 (mu): %.3f\n', params.mu);
+fprintf(fid, '结构先验总权重: %.3f\n', params.structure_weight);
+fprintf(fid, '动态先验比例: %.3f\n', params.dynamic_prior_weight);
+fprintf(fid, '梯度高斯标准差: %.3f\n', params.sigma_gradient);
+fprintf(fid, '角点强度类型: %s\n', params.corner_strength_type);
+fprintf(fid, '最小目标面积: %d\n', params.min_target_area);
+fprintf(fid, '最大目标面积: %d\n', params.max_target_area);
+fprintf(fid, '\n=== 性能指标 ===\n');
+fprintf(fid, '重构相对误差: %.6f\n', reconstruction_error);
+fprintf(fid, '背景能量比例: %.6f\n', background_energy);
+fprintf(fid, '目标能量比例: %.6f\n', target_energy);
+fprintf(fid, '稀疏度（非零元素比例）: %.6f\n', sparsity);
+fprintf(fid, '\n=== 目标检测统计 ===\n');
+fprintf(fid, '平均每帧目标数: %.2f\n', avg_targets_per_frame);
+fprintf(fid, '最大每帧目标数: %d\n', max_targets_per_frame);
+fprintf(fid, '最小每帧目标数: %d\n', min_targets_per_frame);
+fprintf(fid, '平均目标面积: %.2f 像素\n', avg_target_area);
+fprintf(fid, '中值目标面积: %.2f 像素\n', median_target_area);
+
+fclose(fid);
+
+% 显示报告内容
+fprintf('\n=== 结果报告（改进版2） ===\n');
+fprintf('重构相对误差: %.6f\n', reconstruction_error);
+fprintf('背景能量比例: %.6f\n', background_energy);
+fprintf('目标能量比例: %.6f\n', target_energy);
+fprintf('稀疏度: %.6f\n', sparsity);
+fprintf('平均每帧目标数: %.2f\n', avg_targets_per_frame);
+fprintf('平均目标面积: %.2f 像素\n', avg_target_area);
+end
+
+function plot_convergence_curves(primal_residuals, dual_residuals, ranks)
+% 绘制收敛曲线
+figure('Position', [100, 100, 1200, 400], 'Name', '算法收敛曲线');
+
+subplot(1, 3, 1);
+semilogy(primal_residuals, 'b-', 'LineWidth', 2);
+hold on;
+semilogy(dual_residuals, 'r-', 'LineWidth', 2);
+xlabel('迭代次数');
+ylabel('残差（对数尺度）');
+title('ADMM收敛曲线');
+legend('主残差', '对偶残差', 'Location', 'best');
+grid on;
+
+subplot(1, 3, 2);
+plot(ranks, 'g-', 'LineWidth', 2);
+xlabel('迭代次数');
+ylabel('低秩分量秩');
+title('秩演化曲线');
+grid on;
+
+subplot(1, 3, 3);
+if length(primal_residuals) > 1
+    ratio = primal_residuals(2:end) ./ dual_residuals(2:end);
+    plot(2:length(primal_residuals), ratio, 'm-', 'LineWidth', 2);
+    xlabel('迭代次数');
+    ylabel('主残差/对偶残差');
+    title('残差比率');
+    grid on;
+end
+end
+
+function enhanced_target = apply_target_enhancement(target_img)
+% 原始的目标增强函数（保留备用）
+target_abs = abs(target_img);
+target_norm = mat2gray(target_abs);
+threshold = 0.1 * max(target_norm(:));
+target_thresh = target_norm;
+target_thresh(target_thresh < threshold) = 0;
+se = strel('disk', 1);
+target_morph = imopen(target_thresh, se);
+enhanced_target = imadjust(target_morph, [], [], 2.0);
+end
